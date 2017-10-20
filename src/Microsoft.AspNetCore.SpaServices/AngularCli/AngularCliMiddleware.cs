@@ -1,15 +1,15 @@
 // Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
-using System;
-using System.IO;
-using Microsoft.AspNetCore.NodeServices;
-using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
-using System.Threading;
+using Microsoft.AspNetCore.NodeServices;
 using Microsoft.AspNetCore.SpaServices.Proxy;
-using Microsoft.AspNetCore.Http;
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Threading.Tasks;
+using System.Threading;
 
 namespace Microsoft.AspNetCore.SpaServices.AngularCli
 {
@@ -21,6 +21,8 @@ namespace Microsoft.AspNetCore.SpaServices.AngularCli
 
         private readonly INodeServices _nodeServices;
         private readonly string _middlewareScriptPath;
+        private readonly HttpClient _neverTimeOutHttpClient = ConditionalProxy.CreateHttpClientForProxy(
+            Timeout.InfiniteTimeSpan);
 
         public AngularCliMiddleware(IApplicationBuilder appBuilder, string sourcePath, SpaDefaultPageMiddleware defaultPageMiddleware)
         {
@@ -36,11 +38,30 @@ namespace Microsoft.AspNetCore.SpaServices.AngularCli
             // Start Angular CLI and attach to middleware pipeline
             var angularCliServerInfoTask = StartAngularCliServerAsync();
 
-            // Proxy the corresponding requests through ASP.NET and into the Node listener
-            // Anything under /<publicpath> (e.g., /dist) is proxied as a normal HTTP request
-            // with a typical timeout (100s is the default from HttpClient).
-            UseProxyToLocalAngularCliMiddleware(appBuilder, defaultPageMiddleware,
-                angularCliServerInfoTask, TimeSpan.FromSeconds(100));
+            // Everything we proxy is hardcoded to target http://localhost because:
+            // - the requests are always from the local machine (we're not accepting remote
+            //   requests that go directly to the Angular CLI middleware server)
+            // - given that, there's no reason to use https, and we couldn't even if we
+            //   wanted to, because in general the Angular CLI server has no certificate
+            var proxyOptionsTask = angularCliServerInfoTask.ContinueWith(
+                task => new ConditionalProxyMiddlewareTarget(
+                    "http", "localhost", task.Result.Port.ToString()));
+
+            var applicationStoppingToken = GetStoppingToken(appBuilder);
+
+            // Proxy all requests into the Angular CLI server
+            appBuilder.Use(async (context, next) =>
+            {
+                var didProxyRequest = await ConditionalProxy.PerformProxyRequest(
+                    context, _neverTimeOutHttpClient, proxyOptionsTask, applicationStoppingToken);
+
+                // Since we are proxying everything, this is the end of the middleware pipeline.
+                // We won't call next().
+                if (!didProxyRequest)
+                {
+                    context.Response.StatusCode = 404;
+                }
+            });
 
             // Advertise the availability of this feature to other SPA middleware
             appBuilder.Properties.Add(AngularCliMiddlewareKey, this);
@@ -102,51 +123,6 @@ namespace Microsoft.AspNetCore.SpaServices.AngularCli
             await Task.Delay(500);
 
             return angularCliServerInfo;
-        }
-
-        private static void UseProxyToLocalAngularCliMiddleware(
-            IApplicationBuilder appBuilder, SpaDefaultPageMiddleware defaultPageMiddleware,
-            Task<AngularCliServerInfo> serverInfoTask, TimeSpan requestTimeout)
-        {
-            // This is hardcoded to use http://localhost because:
-            // - the requests are always from the local machine (we're not accepting remote
-            //   requests that go directly to the Angular CLI middleware server)
-            // - given that, there's no reason to use https, and we couldn't even if we
-            //   wanted to, because in general the Angular CLI server has no certificate
-            var proxyOptionsTask = serverInfoTask.ContinueWith(
-                task => new ConditionalProxyMiddlewareTarget(
-                    "http", "localhost", task.Result.Port.ToString()));
-
-            // Requests outside /<urlPrefix> are proxied to the default page
-            var hasRewrittenUrlMarker = new object();
-            var defaultPageUrl = defaultPageMiddleware.DefaultPageUrl;
-            var urlPrefix = defaultPageMiddleware.UrlPrefix;
-            var urlPrefixIsRoot = string.IsNullOrEmpty(urlPrefix) || urlPrefix == "/";
-            appBuilder.Use((context, next) =>
-            {
-                if (!urlPrefixIsRoot && !context.Request.Path.StartsWithSegments(urlPrefix))
-                {
-                    context.Items[hasRewrittenUrlMarker] = context.Request.Path;
-                    context.Request.Path = defaultPageUrl;
-                }
-
-                return next();
-            });
-
-            appBuilder.UseMiddleware<ConditionalProxyMiddleware>(urlPrefix, requestTimeout, proxyOptionsTask);
-
-            // If we rewrote the path, rewrite it back. Don't want to interfere with
-            // any other middleware.
-            appBuilder.Use((context, next) =>
-            {
-                if (context.Items.ContainsKey(hasRewrittenUrlMarker))
-                {
-                    context.Request.Path = (PathString)context.Items[hasRewrittenUrlMarker];
-                    context.Items.Remove(hasRewrittenUrlMarker);
-                }
-
-                return next();
-            });
         }
 
 #pragma warning disable CS0649
