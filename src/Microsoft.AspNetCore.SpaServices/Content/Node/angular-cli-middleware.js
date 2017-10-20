@@ -49,13 +49,14 @@ module.exports = {
 function waitForLine(stream, regex) {
     return new Promise(function (resolve, reject) {
         var lineReader = readline.createInterface({ input: stream });
-        lineReader.on('line', function (line) {
+        var listener = function (line) {
             var matches = regex.exec(line);
             if (matches) {
-                lineReader.close();
+                lineReader.removeListener('line', listener);
                 resolve(matches);
             }
-        });
+        };
+        lineReader.addListener('line', listener);
     });
 }
 
